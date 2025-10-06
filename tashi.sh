@@ -360,6 +360,84 @@ bulk_ops() {
   esac
 }
 
+migrate_containers() {
+  local old_prefix="$1"
+  local new_prefix="$2"
+  
+  local containers=()
+  while IFS= read -r name; do
+    [[ -n "$name" ]] && containers+=("$name")
+  done < <(${SUDO_DOCKER}${RUNTIME} ps -a --format '{{.Names}}' | grep -E "^${old_prefix}-[0-9]+$" || true)
+  
+  if [[ ${#containers[@]} -eq 0 ]]; then
+    msg "Нет контейнеров со старым префиксом для миграции"
+    return 0
+  fi
+  
+  echo "Найдены контейнеры для миграции:"
+  for container in "${containers[@]}"; do
+    echo "  - $container"
+  done
+  echo
+  
+  local confirm
+  confirm=$(input_yesno "Переименовать все контейнеры на новый префикс? (y/n) [n] > " "n")
+  if [[ "$confirm" != "y" ]]; then
+    msg "Миграция отменена"
+    return 0
+  fi
+  
+  msg "Начинаю миграцию контейнеров..."
+  for container in "${containers[@]}"; do
+    local idx="${container##*-}"
+    local new_name="${new_prefix}-${idx}"
+    
+    if ${SUDO_DOCKER}${RUNTIME} ps -q -f "name=${new_name}" | grep -q .; then
+      warn "Контейнер ${new_name} уже существует, пропускаю ${container}"
+      continue
+    fi
+    
+    msg "Переименовываю ${container} -> ${new_name}"
+    ${SUDO_DOCKER}${RUNTIME} rename "${container}" "${new_name}" >/dev/null
+    if [[ $? -eq 0 ]]; then
+      ok "${container} переименован в ${new_name}"
+    else
+      err "Ошибка переименования ${container}"
+    fi
+  done
+  
+  ok "Миграция завершена"
+}
+
+apply_settings_changes() {
+  local old_prefix="$1"
+  local new_prefix="$2"
+  
+  if [[ "$old_prefix" != "$new_prefix" ]]; then
+    warn "ВНИМАНИЕ: Изменение префикса контейнера!"
+    warn "Старый префикс: $old_prefix"
+    warn "Новый префикс: $new_prefix"
+    echo
+    echo "Это изменение повлияет на:"
+    echo "- Новые контейнеры будут создаваться с новым префиксом"
+    echo "- Существующие контейнеры останутся со старым префиксом"
+    echo "- Для работы с существующими контейнерами используйте старый префикс"
+    echo
+    local confirm
+    confirm=$(input_yesno "Продолжить изменение? (y/n) [y] > " "y")
+    if [[ "$confirm" != "y" ]]; then
+      CONTAINER_PREFIX="$old_prefix"
+      msg "Изменение отменено"
+      return 1
+    fi
+    
+    # Предложить миграцию существующих контейнеров
+    echo
+    migrate_containers "$old_prefix" "$new_prefix"
+  fi
+  return 0
+}
+
 settings_menu() {
   while :; do
     clear
@@ -371,49 +449,91 @@ settings_menu() {
     echo "5) Изменить префикс контейнера (текущий: ${CONTAINER_PREFIX})"
     echo "6) Изменить префикс тома (текущий: ${VOLUME_PREFIX})"
     echo "7) Изменить настройку автообновления по умолчанию (текущий: ${AUTO_UPDATE_DEFAULT})"
+    echo "8) Показать все настройки"
     echo "0) Назад"
     read -rp "Выбор > " choice || return 0
     
     case "$choice" in
       1)
         read -rp "Новый образ > " new_image || true
-        [[ -n "${new_image:-}" ]] && IMAGE_TAG="$new_image"
-        ok "Образ изменен на: ${IMAGE_TAG}"
+        if [[ -n "${new_image:-}" ]]; then
+          IMAGE_TAG="$new_image"
+          ok "Образ изменен на: ${IMAGE_TAG}"
+        else
+          warn "Образ не изменен"
+        fi
         pause
         ;;
       2)
         read -rp "Новый RUST_LOG > " new_log || true
-        [[ -n "${new_log:-}" ]] && RUST_LOG="$new_log"
-        ok "RUST_LOG изменен на: ${RUST_LOG}"
+        if [[ -n "${new_log:-}" ]]; then
+          RUST_LOG="$new_log"
+          ok "RUST_LOG изменен на: ${RUST_LOG}"
+        else
+          warn "RUST_LOG не изменен"
+        fi
         pause
         ;;
       3)
         new_port=$(input_number "Новый базовый порт агента > ")
-        BASE_AGENT_PORT="$new_port"
-        ok "Базовый порт агента изменен на: ${BASE_AGENT_PORT}"
+        if [[ "$new_port" -ne "$BASE_AGENT_PORT" ]]; then
+          BASE_AGENT_PORT="$new_port"
+          ok "Базовый порт агента изменен на: ${BASE_AGENT_PORT}"
+        else
+          warn "Порт не изменен"
+        fi
         pause
         ;;
       4)
         new_port=$(input_number "Новый базовый порт метрик > ")
-        BASE_METRICS_PORT="$new_port"
-        ok "Базовый порт метрик изменен на: ${BASE_METRICS_PORT}"
+        if [[ "$new_port" -ne "$BASE_METRICS_PORT" ]]; then
+          BASE_METRICS_PORT="$new_port"
+          ok "Базовый порт метрик изменен на: ${BASE_METRICS_PORT}"
+        else
+          warn "Порт не изменен"
+        fi
         pause
         ;;
       5)
+        local old_prefix="$CONTAINER_PREFIX"
         read -rp "Новый префикс контейнера > " new_prefix || true
-        [[ -n "${new_prefix:-}" ]] && CONTAINER_PREFIX="$new_prefix"
-        ok "Префикс контейнера изменен на: ${CONTAINER_PREFIX}"
+        if [[ -n "${new_prefix:-}" && "$new_prefix" != "$old_prefix" ]]; then
+          CONTAINER_PREFIX="$new_prefix"
+          if apply_settings_changes "$old_prefix" "$new_prefix"; then
+            ok "Префикс контейнера изменен на: ${CONTAINER_PREFIX}"
+          fi
+        else
+          warn "Префикс не изменен"
+        fi
         pause
         ;;
       6)
         read -rp "Новый префикс тома > " new_vol_prefix || true
-        [[ -n "${new_vol_prefix:-}" ]] && VOLUME_PREFIX="$new_vol_prefix"
-        ok "Префикс тома изменен на: ${VOLUME_PREFIX}"
+        if [[ -n "${new_vol_prefix:-}" ]]; then
+          VOLUME_PREFIX="$new_vol_prefix"
+          ok "Префикс тома изменен на: ${VOLUME_PREFIX}"
+        else
+          warn "Префикс тома не изменен"
+        fi
         pause
         ;;
       7)
         AUTO_UPDATE_DEFAULT=$(input_yesno "Включить автообновления по умолчанию? (y/n) [${AUTO_UPDATE_DEFAULT}] > " "$AUTO_UPDATE_DEFAULT")
         ok "Автообновления по умолчанию: ${AUTO_UPDATE_DEFAULT}"
+        pause
+        ;;
+      8)
+        clear
+        echo -e "${BOLD}Текущие настройки:${RESET}"
+        echo "Образ: ${IMAGE_TAG}"
+        echo "RUST_LOG: ${RUST_LOG}"
+        echo "Базовый порт агента: ${BASE_AGENT_PORT}"
+        echo "Базовый порт метрик: ${BASE_METRICS_PORT}"
+        echo "Префикс контейнера: ${CONTAINER_PREFIX}"
+        echo "Префикс тома: ${VOLUME_PREFIX}"
+        echo "Автообновления по умолчанию: ${AUTO_UPDATE_DEFAULT}"
+        echo "Платформа: ${PLATFORM_ARG:-не задана}"
+        echo "Флаг pull: ${PULL_FLAG}"
         pause
         ;;
       0) return 0;;
