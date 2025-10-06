@@ -208,7 +208,259 @@ add_one() {
   ok "Готово."
 }
 
-# ... остальные функции (start_stop_restart_one, logs_one, update_target, remove_target, bulk_ops, settings_menu, instance_menu) без изменений ...
+start_stop_restart_one() {
+  local idx="$1"
+  local action="$2"
+  local cname; cname=$(name_for "$idx")
+  
+  case "$action" in
+    start)
+      if ${SUDO_DOCKER}${RUNTIME} ps -q -f "name=${cname}" | grep -q .; then
+        warn "${cname} уже запущен"
+      else
+        ${SUDO_DOCKER}${RUNTIME} start "${cname}" >/dev/null
+        ok "${cname}: запущен"
+      fi
+      ;;
+    stop)
+      if ${SUDO_DOCKER}${RUNTIME} ps -q -f "name=${cname}" | grep -q .; then
+        ${SUDO_DOCKER}${RUNTIME} stop "${cname}" >/dev/null
+        ok "${cname}: остановлен"
+      else
+        warn "${cname} не запущен"
+      fi
+      ;;
+    restart)
+      ${SUDO_DOCKER}${RUNTIME} restart "${cname}" >/dev/null
+      ok "${cname}: перезапущен"
+      ;;
+  esac
+}
+
+logs_one() {
+  local idx="$1"
+  local cname; cname=$(name_for "$idx")
+  
+  if ! ${SUDO_DOCKER}${RUNTIME} ps -a -q -f "name=${cname}" | grep -q .; then
+    err "Контейнер ${cname} не найден"
+    return 1
+  fi
+  
+  msg "Логи ${cname} (Ctrl+C для выхода):"
+  ${SUDO_DOCKER}${RUNTIME} logs -f "${cname}"
+}
+
+update_target() {
+  local idx="$1"
+  local cname; cname=$(name_for "$idx")
+  
+  if ! ${SUDO_DOCKER}${RUNTIME} ps -a -q -f "name=${cname}" | grep -q .; then
+    err "Контейнер ${cname} не найден"
+    return 1
+  fi
+  
+  msg "Обновление ${cname}..."
+  ${SUDO_DOCKER}${RUNTIME} pull ${PULL_FLAG} ${PLATFORM_ARG} "${IMAGE_TAG}" >/dev/null
+  ${SUDO_DOCKER}${RUNTIME} stop "${cname}" >/dev/null
+  ${SUDO_DOCKER}${RUNTIME} rm "${cname}" >/dev/null
+  
+  local vname; vname=$(vol_for "$idx")
+  local aport; aport=$(aport_for "$idx")
+  local mport; mport=$(mport_for "$idx")
+  
+  local auto_arg="--unstable-update-download-path /tmp/tashi-depin-worker"
+  local pub_ip="" pub_arg=""
+  if command -v curl >/dev/null 2>&1; then pub_ip=$(curl -s --max-time 2 https://api.ipify.org || true); fi
+  [[ -n "$pub_ip" ]] && pub_arg="--agent-public-addr=${pub_ip}:${aport}"
+  
+  ${SUDO_DOCKER}${RUNTIME} run -d \
+    -p "${aport}:${aport}" \
+    -p "127.0.0.1:${mport}:9000" \
+    --mount "type=volume,src=${vname},dst=/home/worker/auth" \
+    --name "${cname}" \
+    -e "RUST_LOG=${RUST_LOG}" \
+    --label "tashi.instance=${idx}" \
+    --label "tashi.agent_port=${aport}" \
+    --label "tashi.metrics_port=${mport}" \
+    --restart=on-failure \
+    ${PULL_FLAG} ${PLATFORM_ARG} \
+    "${IMAGE_TAG}" \
+    run /home/worker/auth \
+    ${auto_arg} \
+    ${pub_arg} >/dev/null
+  
+  ok "${cname}: обновлен и запущен"
+}
+
+remove_target() {
+  local idx="$1"
+  local cname; cname=$(name_for "$idx")
+  local vname; vname=$(vol_for "$idx")
+  
+  if ! ${SUDO_DOCKER}${RUNTIME} ps -a -q -f "name=${cname}" | grep -q .; then
+    err "Контейнер ${cname} не найден"
+    return 1
+  fi
+  
+  local confirm
+  confirm=$(input_yesno "Удалить ${cname} и его данные? (y/n) [n] > " "n")
+  if [[ "$confirm" == "y" ]]; then
+    ${SUDO_DOCKER}${RUNTIME} stop "${cname}" >/dev/null 2>&1 || true
+    ${SUDO_DOCKER}${RUNTIME} rm "${cname}" >/dev/null
+    ${SUDO_DOCKER}${RUNTIME} volume rm "${vname}" >/dev/null 2>&1 || true
+    ok "${cname}: удален"
+  else
+    msg "Отменено"
+  fi
+}
+
+bulk_ops() {
+  ensure_docker
+  list_instances
+  echo
+  echo "1) Запустить все"
+  echo "2) Остановить все"
+  echo "3) Перезапустить все"
+  echo "4) Обновить все"
+  echo "0) Назад"
+  read -rp "Выбор > " choice || return 0
+  
+  case "$choice" in
+    1)
+      msg "Запуск всех инстансов..."
+      ${SUDO_DOCKER}${RUNTIME} ps -a --format '{{.Names}}' | grep -E "^${CONTAINER_PREFIX}-[0-9]+$" | while read -r name; do
+        idx="${name##*-}"
+        start_stop_restart_one "$idx" "start"
+      done
+      ;;
+    2)
+      msg "Остановка всех инстансов..."
+      ${SUDO_DOCKER}${RUNTIME} ps -q -f "label=tashi.instance" | while read -r id; do
+        ${SUDO_DOCKER}${RUNTIME} stop "$id" >/dev/null
+      done
+      ok "Все инстансы остановлены"
+      ;;
+    3)
+      msg "Перезапуск всех инстансов..."
+      ${SUDO_DOCKER}${RUNTIME} ps -a --format '{{.Names}}' | grep -E "^${CONTAINER_PREFIX}-[0-9]+$" | while read -r name; do
+        idx="${name##*-}"
+        start_stop_restart_one "$idx" "restart"
+      done
+      ;;
+    4)
+      msg "Обновление всех инстансов..."
+      ${SUDO_DOCKER}${RUNTIME} pull ${PULL_FLAG} ${PLATFORM_ARG} "${IMAGE_TAG}" >/dev/null
+      ${SUDO_DOCKER}${RUNTIME} ps -a --format '{{.Names}}' | grep -E "^${CONTAINER_PREFIX}-[0-9]+$" | while read -r name; do
+        idx="${name##*-}"
+        update_target "$idx"
+      done
+      ;;
+    0) return 0;;
+    *) warn "Неверный выбор"; pause;;
+  esac
+}
+
+settings_menu() {
+  while :; do
+    clear
+    echo -e "${BOLD}Настройки${RESET}"
+    echo "1) Изменить образ (текущий: ${IMAGE_TAG})"
+    echo "2) Изменить RUST_LOG (текущий: ${RUST_LOG})"
+    echo "3) Изменить базовый порт агента (текущий: ${BASE_AGENT_PORT})"
+    echo "4) Изменить базовый порт метрик (текущий: ${BASE_METRICS_PORT})"
+    echo "5) Изменить префикс контейнера (текущий: ${CONTAINER_PREFIX})"
+    echo "6) Изменить префикс тома (текущий: ${VOLUME_PREFIX})"
+    echo "7) Изменить настройку автообновления по умолчанию (текущий: ${AUTO_UPDATE_DEFAULT})"
+    echo "0) Назад"
+    read -rp "Выбор > " choice || return 0
+    
+    case "$choice" in
+      1)
+        read -rp "Новый образ > " new_image || true
+        [[ -n "${new_image:-}" ]] && IMAGE_TAG="$new_image"
+        ok "Образ изменен на: ${IMAGE_TAG}"
+        pause
+        ;;
+      2)
+        read -rp "Новый RUST_LOG > " new_log || true
+        [[ -n "${new_log:-}" ]] && RUST_LOG="$new_log"
+        ok "RUST_LOG изменен на: ${RUST_LOG}"
+        pause
+        ;;
+      3)
+        new_port=$(input_number "Новый базовый порт агента > ")
+        BASE_AGENT_PORT="$new_port"
+        ok "Базовый порт агента изменен на: ${BASE_AGENT_PORT}"
+        pause
+        ;;
+      4)
+        new_port=$(input_number "Новый базовый порт метрик > ")
+        BASE_METRICS_PORT="$new_port"
+        ok "Базовый порт метрик изменен на: ${BASE_METRICS_PORT}"
+        pause
+        ;;
+      5)
+        read -rp "Новый префикс контейнера > " new_prefix || true
+        [[ -n "${new_prefix:-}" ]] && CONTAINER_PREFIX="$new_prefix"
+        ok "Префикс контейнера изменен на: ${CONTAINER_PREFIX}"
+        pause
+        ;;
+      6)
+        read -rp "Новый префикс тома > " new_vol_prefix || true
+        [[ -n "${new_vol_prefix:-}" ]] && VOLUME_PREFIX="$new_vol_prefix"
+        ok "Префикс тома изменен на: ${VOLUME_PREFIX}"
+        pause
+        ;;
+      7)
+        AUTO_UPDATE_DEFAULT=$(input_yesno "Включить автообновления по умолчанию? (y/n) [${AUTO_UPDATE_DEFAULT}] > " "$AUTO_UPDATE_DEFAULT")
+        ok "Автообновления по умолчанию: ${AUTO_UPDATE_DEFAULT}"
+        pause
+        ;;
+      0) return 0;;
+      *) warn "Неверный выбор"; pause;;
+    esac
+  done
+}
+
+instance_menu() {
+  ensure_docker
+  list_instances
+  echo
+  local idx
+  idx=$(input_number "Номер инстанса (0 для выхода) > ")
+  [[ "$idx" -eq 0 ]] && return 0
+  
+  local cname; cname=$(name_for "$idx")
+  if ! ${SUDO_DOCKER}${RUNTIME} ps -a -q -f "name=${cname}" | grep -q .; then
+    err "Инстанс ${idx} не найден"
+    pause
+    return 1
+  fi
+  
+  while :; do
+    clear
+    echo -e "${BOLD}Управление инстансом ${idx} (${cname})${RESET}"
+    echo "1) Запустить"
+    echo "2) Остановить"
+    echo "3) Перезапустить"
+    echo "4) Логи"
+    echo "5) Обновить"
+    echo "6) Удалить"
+    echo "0) Назад"
+    read -rp "Выбор > " choice || return 0
+    
+    case "$choice" in
+      1) start_stop_restart_one "$idx" "start"; pause;;
+      2) start_stop_restart_one "$idx" "stop"; pause;;
+      3) start_stop_restart_one "$idx" "restart"; pause;;
+      4) logs_one "$idx"; pause;;
+      5) update_target "$idx"; pause;;
+      6) remove_target "$idx"; pause;;
+      0) return 0;;
+      *) warn "Неверный выбор"; pause;;
+    esac
+  done
+}
 
 # ========= ГЛАВНОЕ МЕНЮ =========
 main_menu() {
