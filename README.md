@@ -23,7 +23,7 @@
 ### Быстрая установка одной командой
 
 ```bash
-curl -o tashi.sh https://raw.githubusercontent.com/Xtoun/tashi-manager/main/tashi.sh && chmod +x tashi.sh && ./tashi.sh
+curl -o tashi.sh https://raw.githubusercontent.com/Xtoun/tashi-manager/refs/heads/master/tashi.sh && chmod +x tashi.sh && ./tashi.sh
 ```
 
 **Примечание:** При первом запуске скрипт автоматически:
