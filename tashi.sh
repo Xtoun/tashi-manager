@@ -171,7 +171,7 @@ run_instance() {
     --label "tashi.instance=${idx}" \
     --label "tashi.agent_port=${aport}" \
     --label "tashi.metrics_port=${mport}" \
-    --restart=on-failure \
+    --restart=unless-stopped \
     ${PULL_FLAG} ${PLATFORM_ARG} \
     "${IMAGE_TAG}" \
     run /home/worker/auth \
@@ -260,7 +260,7 @@ update_target() {
   fi
   
   msg "Обновление ${cname}..."
-  ${SUDO_DOCKER}${RUNTIME} pull ${PULL_FLAG} ${PLATFORM_ARG} "${IMAGE_TAG}" >/dev/null
+  ${SUDO_DOCKER}${RUNTIME} pull ${PLATFORM_ARG} "${IMAGE_TAG}" >/dev/null
   ${SUDO_DOCKER}${RUNTIME} stop "${cname}" >/dev/null
   ${SUDO_DOCKER}${RUNTIME} rm "${cname}" >/dev/null
   
@@ -282,7 +282,7 @@ update_target() {
     --label "tashi.instance=${idx}" \
     --label "tashi.agent_port=${aport}" \
     --label "tashi.metrics_port=${mport}" \
-    --restart=on-failure \
+    --restart=unless-stopped \
     ${PULL_FLAG} ${PLATFORM_ARG} \
     "${IMAGE_TAG}" \
     run /home/worker/auth \
@@ -349,7 +349,7 @@ bulk_ops() {
       ;;
     4)
       msg "Обновление всех инстансов..."
-      ${SUDO_DOCKER}${RUNTIME} pull ${PULL_FLAG} ${PLATFORM_ARG} "${IMAGE_TAG}" >/dev/null
+      ${SUDO_DOCKER}${RUNTIME} pull ${PLATFORM_ARG} "${IMAGE_TAG}" >/dev/null
       ${SUDO_DOCKER}${RUNTIME} ps -a --format '{{.Names}}' | grep -E "^${CONTAINER_PREFIX}-[0-9]+$" | while read -r name; do
         idx="${name##*-}"
         update_target "$idx"
