@@ -582,93 +582,68 @@ instance_menu() {
   done
 }
 
-# ========= АВТОПЕРЕЗАГРУЗКА =========
-enable_auto_restart() {
-  local script_path="$0"
-  local cron_job="0 */2 * * * cd $(dirname "$script_path") && bash $(basename "$script_path") --auto-restart"
-  
-  # Проверяем, есть ли уже задача автоперезагрузки
-  if crontab -l 2>/dev/null | grep -q "tashi.*auto-restart"; then
-    warn "Автоперезагрузка уже включена"
-    return 1
-  fi
-  
-  # Добавляем задачу в crontab
-  (crontab -l 2>/dev/null; echo "$cron_job") | crontab -
-  
-  if [[ $? -eq 0 ]]; then
-    ok "Автоперезагрузка включена. Контейнеры будут перезагружаться каждые 2 часа."
-    ok "Cron задача добавлена: $cron_job"
-  else
-    err "Ошибка добавления задачи в crontab"
-    return 1
-  fi
-}
-
-disable_auto_restart() {
-  # Удаляем задачу автоперезагрузки из crontab
-  crontab -l 2>/dev/null | grep -v "tashi.*auto-restart" | crontab -
-  
-  if [[ $? -eq 0 ]]; then
-    ok "Автоперезагрузка отключена"
-  else
-    err "Ошибка удаления задачи из crontab"
-    return 1
-  fi
-}
-
-check_auto_restart_status() {
-  if crontab -l 2>/dev/null | grep -q "tashi.*auto-restart"; then
-    ok "Автоперезагрузка включена"
-    echo "Расписание: каждые 2 часа"
-    echo "Задача: $(crontab -l 2>/dev/null | grep "tashi.*auto-restart")"
-  else
-    warn "Автоперезагрузка отключена"
-  fi
-}
-
-auto_restart_all_containers() {
-  ensure_docker
-  msg "Автоматическая перезагрузка всех контейнеров Tashi..."
-  
-  local restarted_count=0
-  ${SUDO_DOCKER}${RUNTIME} ps -a --format '{{.Names}}' | grep -E "^${CONTAINER_PREFIX}-[0-9]+$" | while read -r name; do
-    idx="${name##*-}"
-    if ${SUDO_DOCKER}${RUNTIME} ps -q -f "name=${name}" | grep -q .; then
-      msg "Перезагружаю ${name}..."
-      ${SUDO_DOCKER}${RUNTIME} restart "${name}" >/dev/null
-      ok "${name}: перезагружен"
-      ((restarted_count++))
+# ========= АВТОПЕРЕЗАПУСК ЧЕРЕЗ CRON =========
+ensure_cron() {
+  # Установка и запуск cron, если нужно
+  if ! command -v crontab >/dev/null 2>&1; then
+    warn "cron не найден, устанавливаю..."
+    if command -v apt >/dev/null 2>&1; then
+      sudo apt update -y >/dev/null
+      sudo apt install -y cron >/dev/null
+    else
+      err "Не удалось установить cron автоматически. Установите вручную."
+      return 1
     fi
-  done
-  
-  if [[ $restarted_count -gt 0 ]]; then
-    ok "Перезагружено контейнеров: $restarted_count"
-  else
-    warn "Нет запущенных контейнеров для перезагрузки"
+  fi
+  # Запускаем службу cron
+  if command -v systemctl >/dev/null 2>&1; then
+    sudo systemctl enable cron >/dev/null 2>&1 || true
+    sudo systemctl start cron >/dev/null 2>&1 || true
   fi
 }
 
-auto_restart_menu() {
-  while :; do
-    clear
-    echo -e "${BOLD}Автоперезагрузка контейнеров${RESET}"
-    echo "1) Включить автоперезагрузку (каждые 2 часа)"
-    echo "2) Выключить автоперезагрузку"
-    echo "3) Проверить статус автоперезагрузки"
-    echo "4) Перезагрузить все контейнеры сейчас"
-    echo "0) Назад"
-    read -rp "Выбор > " choice || return 0
-    
-    case "$choice" in
-      1) enable_auto_restart; pause;;
-      2) disable_auto_restart; pause;;
-      3) check_auto_restart_status; pause;;
-      4) auto_restart_all_containers; pause;;
-      0) return 0;;
-      *) warn "Неверный выбор"; pause;;
-    esac
-  done
+create_restart_helper() {
+  # Скрипт, который умеет перезапускать все Tashi-контейнеры
+  local helper="/usr/local/bin/tashi-restart-all"
+  if [[ ! -f "$helper" ]]; then
+    sudo tee "$helper" >/dev/null <<'EOS'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+RUNTIME="/usr/bin/docker"
+# Если docker требует sudo в окружении cron — используем его
+if ! $RUNTIME ps >/dev/null 2>&1; then
+  RUNTIME="sudo /usr/bin/docker"
+fi
+# Перезапускаем все контейнеры, помеченные меткой tashi.instance
+$RUNTIME ps -a -q -f "label=tashi.instance" | while read -r id; do
+  [[ -n "$id" ]] && $RUNTIME restart "$id" >/dev/null || true
+done
+EOS
+    sudo chmod +x "$helper"
+    ok "Создан помощник автоперезапуска: $helper"
+  fi
+}
+
+enable_autorestart() {
+  ensure_cron || return 1
+  create_restart_helper
+
+  local tag="# TASHI_AUTO_RESTART"
+  local line='0 */2 * * * /usr/local/bin/tashi-restart-all >/tmp/tashi-auto-restart.log 2>&1 # TASHI_AUTO_RESTART'
+
+  # Удалим возможные старые дубликаты и добавим свежую строку
+  ( crontab -l 2>/dev/null | grep -v "$tag"; echo "$line" ) | crontab -
+  ok "Автоперезапуск включён (каждые 2 часа)."
+}
+
+disable_autorestart() {
+  local tag="# TASHI_AUTO_RESTART"
+  if crontab -l 2>/dev/null | grep -q "$tag"; then
+    crontab -l 2>/dev/null | grep -v "$tag" | crontab -
+    ok "Автоперезапуск отключён."
+  else
+    warn "Автоперезапуск уже отключён (запись cron не найдена)."
+  fi
 }
 
 # ========= ГЛАВНОЕ МЕНЮ =========
@@ -682,7 +657,8 @@ main_menu() {
     echo "3) Массовые действия (start/stop/restart)"
     echo "4) Управление инстансом"
     echo "5) Настройки"
-    echo "6) Автоперезагрузка"
+    echo "6) Включить автоперезапуск (cron каждые 2 часа)"
+    echo "7) Отключить автоперезапуск"
     echo "0) Выход"
     read -rp "Выбор > " choice || exit 0
     case "$choice" in
@@ -691,17 +667,12 @@ main_menu() {
       3) bulk_ops; pause;;
       4) instance_menu;;
       5) settings_menu;;
-      6) auto_restart_menu;;
+      6) enable_autorestart; pause;;
+      7) disable_autorestart; pause;;
       0) exit 0;;
       *) warn "Неверный выбор"; pause;;
     esac
   done
 }
-
-# ========= ОБРАБОТКА АРГУМЕНТОВ КОМАНДНОЙ СТРОКИ =========
-if [[ "${1:-}" == "--auto-restart" ]]; then
-  auto_restart_all_containers
-  exit 0
-fi
 
 main_menu
