@@ -582,6 +582,95 @@ instance_menu() {
   done
 }
 
+# ========= АВТОПЕРЕЗАГРУЗКА =========
+enable_auto_restart() {
+  local script_path="$0"
+  local cron_job="0 */2 * * * cd $(dirname "$script_path") && bash $(basename "$script_path") --auto-restart"
+  
+  # Проверяем, есть ли уже задача автоперезагрузки
+  if crontab -l 2>/dev/null | grep -q "tashi.*auto-restart"; then
+    warn "Автоперезагрузка уже включена"
+    return 1
+  fi
+  
+  # Добавляем задачу в crontab
+  (crontab -l 2>/dev/null; echo "$cron_job") | crontab -
+  
+  if [[ $? -eq 0 ]]; then
+    ok "Автоперезагрузка включена. Контейнеры будут перезагружаться каждые 2 часа."
+    ok "Cron задача добавлена: $cron_job"
+  else
+    err "Ошибка добавления задачи в crontab"
+    return 1
+  fi
+}
+
+disable_auto_restart() {
+  # Удаляем задачу автоперезагрузки из crontab
+  crontab -l 2>/dev/null | grep -v "tashi.*auto-restart" | crontab -
+  
+  if [[ $? -eq 0 ]]; then
+    ok "Автоперезагрузка отключена"
+  else
+    err "Ошибка удаления задачи из crontab"
+    return 1
+  fi
+}
+
+check_auto_restart_status() {
+  if crontab -l 2>/dev/null | grep -q "tashi.*auto-restart"; then
+    ok "Автоперезагрузка включена"
+    echo "Расписание: каждые 2 часа"
+    echo "Задача: $(crontab -l 2>/dev/null | grep "tashi.*auto-restart")"
+  else
+    warn "Автоперезагрузка отключена"
+  fi
+}
+
+auto_restart_all_containers() {
+  ensure_docker
+  msg "Автоматическая перезагрузка всех контейнеров Tashi..."
+  
+  local restarted_count=0
+  ${SUDO_DOCKER}${RUNTIME} ps -a --format '{{.Names}}' | grep -E "^${CONTAINER_PREFIX}-[0-9]+$" | while read -r name; do
+    idx="${name##*-}"
+    if ${SUDO_DOCKER}${RUNTIME} ps -q -f "name=${name}" | grep -q .; then
+      msg "Перезагружаю ${name}..."
+      ${SUDO_DOCKER}${RUNTIME} restart "${name}" >/dev/null
+      ok "${name}: перезагружен"
+      ((restarted_count++))
+    fi
+  done
+  
+  if [[ $restarted_count -gt 0 ]]; then
+    ok "Перезагружено контейнеров: $restarted_count"
+  else
+    warn "Нет запущенных контейнеров для перезагрузки"
+  fi
+}
+
+auto_restart_menu() {
+  while :; do
+    clear
+    echo -e "${BOLD}Автоперезагрузка контейнеров${RESET}"
+    echo "1) Включить автоперезагрузку (каждые 2 часа)"
+    echo "2) Выключить автоперезагрузку"
+    echo "3) Проверить статус автоперезагрузки"
+    echo "4) Перезагрузить все контейнеры сейчас"
+    echo "0) Назад"
+    read -rp "Выбор > " choice || return 0
+    
+    case "$choice" in
+      1) enable_auto_restart; pause;;
+      2) disable_auto_restart; pause;;
+      3) check_auto_restart_status; pause;;
+      4) auto_restart_all_containers; pause;;
+      0) return 0;;
+      *) warn "Неверный выбор"; pause;;
+    esac
+  done
+}
+
 # ========= ГЛАВНОЕ МЕНЮ =========
 main_menu() {
   ensure_docker
@@ -593,6 +682,7 @@ main_menu() {
     echo "3) Массовые действия (start/stop/restart)"
     echo "4) Управление инстансом"
     echo "5) Настройки"
+    echo "6) Автоперезагрузка"
     echo "0) Выход"
     read -rp "Выбор > " choice || exit 0
     case "$choice" in
@@ -601,10 +691,17 @@ main_menu() {
       3) bulk_ops; pause;;
       4) instance_menu;;
       5) settings_menu;;
+      6) auto_restart_menu;;
       0) exit 0;;
       *) warn "Неверный выбор"; pause;;
     esac
   done
 }
+
+# ========= ОБРАБОТКА АРГУМЕНТОВ КОМАНДНОЙ СТРОКИ =========
+if [[ "${1:-}" == "--auto-restart" ]]; then
+  auto_restart_all_containers
+  exit 0
+fi
 
 main_menu
