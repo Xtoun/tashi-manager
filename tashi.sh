@@ -588,17 +588,34 @@ ensure_cron() {
   if ! command -v crontab >/dev/null 2>&1; then
     warn "cron не найден, устанавливаю..."
     if command -v apt >/dev/null 2>&1; then
-      sudo apt update -y >/dev/null
-      sudo apt install -y cron >/dev/null
+      if sudo apt update -y >/dev/null && sudo apt install -y cron >/dev/null; then
+        ok "cron установлен"
+      else
+        err "Не удалось установить cron через apt"
+        return 1
+      fi
     else
       err "Не удалось установить cron автоматически. Установите вручную."
       return 1
     fi
   fi
+  
   # Запускаем службу cron
   if command -v systemctl >/dev/null 2>&1; then
-    sudo systemctl enable cron >/dev/null 2>&1 || true
-    sudo systemctl start cron >/dev/null 2>&1 || true
+    if sudo systemctl enable cron >/dev/null 2>&1 && sudo systemctl start cron >/dev/null 2>&1; then
+      ok "Служба cron запущена"
+    else
+      warn "Не удалось запустить службу cron, но crontab доступен"
+    fi
+  fi
+  
+  # Проверяем, что crontab работает
+  if crontab -l >/dev/null 2>&1; then
+    ok "crontab готов к использованию"
+    return 0
+  else
+    err "crontab не работает. Проверьте права доступа."
+    return 1
   fi
 }
 
@@ -606,7 +623,7 @@ create_restart_helper() {
   # Скрипт, который умеет перезапускать все Tashi-контейнеры
   local helper="/usr/local/bin/tashi-restart-all"
   if [[ ! -f "$helper" ]]; then
-    sudo tee "$helper" >/dev/null <<'EOS'
+    if sudo tee "$helper" >/dev/null <<'EOS'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 RUNTIME="/usr/bin/docker"
@@ -619,21 +636,54 @@ $RUNTIME ps -a -q -f "label=tashi.instance" | while read -r id; do
   [[ -n "$id" ]] && $RUNTIME restart "$id" >/dev/null || true
 done
 EOS
-    sudo chmod +x "$helper"
-    ok "Создан помощник автоперезапуска: $helper"
+    then
+      if sudo chmod +x "$helper"; then
+        ok "Создан помощник автоперезапуска: $helper"
+        return 0
+      else
+        err "Не удалось установить права выполнения для $helper"
+        return 1
+      fi
+    else
+      err "Не удалось создать файл $helper"
+      return 1
+    fi
+  else
+    ok "Помощник автоперезапуска уже существует: $helper"
+    return 0
   fi
 }
 
 enable_autorestart() {
-  ensure_cron || return 1
-  create_restart_helper
+  msg "Настройка автоперезапуска..."
+  
+  if ! ensure_cron; then
+    err "Не удалось установить или запустить cron. Проверьте права доступа."
+    return 1
+  fi
+  
+  if ! create_restart_helper; then
+    err "Не удалось создать скрипт автоперезапуска. Проверьте права доступа."
+    return 1
+  fi
 
   local tag="# TASHI_AUTO_RESTART"
   local line='0 */2 * * * /usr/local/bin/tashi-restart-all >/tmp/tashi-auto-restart.log 2>&1 # TASHI_AUTO_RESTART'
 
+  # Проверяем, есть ли уже такая запись
+  if crontab -l 2>/dev/null | grep -q "$tag"; then
+    warn "Автоперезапуск уже включён."
+    return 0
+  fi
+
   # Удалим возможные старые дубликаты и добавим свежую строку
-  ( crontab -l 2>/dev/null | grep -v "$tag"; echo "$line" ) | crontab -
-  ok "Автоперезапуск включён (каждые 2 часа)."
+  if ( crontab -l 2>/dev/null | grep -v "$tag"; echo "$line" ) | crontab -; then
+    ok "Автоперезапуск включён (каждые 2 часа)."
+    msg "Логи автоперезапуска будут сохраняться в /tmp/tashi-auto-restart.log"
+  else
+    err "Не удалось добавить задачу в crontab. Проверьте права доступа."
+    return 1
+  fi
 }
 
 disable_autorestart() {
@@ -667,7 +717,14 @@ main_menu() {
       3) bulk_ops; pause;;
       4) instance_menu;;
       5) settings_menu;;
-      6) enable_autorestart; pause;;
+      6) 
+        if enable_autorestart; then
+          pause
+        else
+          err "Не удалось включить автоперезапуск"
+          pause
+        fi
+        ;;
       7) disable_autorestart; pause;;
       0) exit 0;;
       *) warn "Неверный выбор"; pause;;
